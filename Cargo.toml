@@ -1,0 +1,23 @@
+[package]
+name = "csv-postgres-schema-helper"
+version = "0.0.0"
+edition = "2024"
+description = "Infer a temporal Postgres schema from monthly account CSVs and load only the deltas"
+authors = ["Allan <al@internal.aigu.io>"]
+publish = false
+
+[[bin]]
+name = "csv-pg-schema"
+path = "src/main.rs"
+
+[dependencies]
+csv = "1"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros"] }
+tokio-postgres = "0.7"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+cargo = { level = "warn", priority = -1 }
