@@ -1,0 +1,7 @@
+account_id,holder_name,account_type,currency,balance,credit_limit,status,region_code,opened_on
+2001,Ada Lovelace,checking,USD,1480.00,,active,NA,2019-04-01
+2002,Alan Turing,savings,CAD,8000.00,,active,EU,2020-07-15
+2003,"Hopper, Grace",credit,USD,-300.00,5000.00,active,NA,2018-01-09
+2004,Edsger Dijkstra,checking,USD,520.00,,dormant,EU,2021-11-30
+2005,Katherine Johnson,savings,USD,29500.00,,active,NA,2022-02-28
+2006,Margaret Hamilton,checking,USD,12000.00,,active,NA,2023-09-12

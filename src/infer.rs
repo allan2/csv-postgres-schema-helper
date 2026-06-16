@@ -1,13 +1,16 @@
 //! Column-type and enum inference.
 //!
 //! We scan every CSV in the manifest once, accumulating per-column facts:
-//! which scalar types every non-null value still satisfies, whether any
-//! null was seen, and the set of distinct values (capped, so a
-//! high-cardinality column can't blow up memory). From those facts we
-//! pick the most specific Postgres type that fits and flag low-cardinality
-//! columns as enum-like — exactly the "a loan is fixed or variable" case
-//! from the README. Because we scan *all* listed months, a rare value that
-//! only appears in a later month is still captured.
+//! which scalar types every non-null value still satisfies, how many nulls
+//! were seen, the set of distinct values (capped, so a high-cardinality
+//! column can't blow up memory), and a value [`Profile`] — numeric/temporal
+//! range, the digits needed for a `numeric(p, s)`, text length, and
+//! character class. From those facts we pick the most specific Postgres type
+//! that fits, flag low-cardinality columns as enum-like — exactly the "a
+//! loan is fixed or variable" case from the README — and let the report turn
+//! the profile into constraint suggestions. Because we scan *all* listed
+//! months, a rare value that only appears in a later month is still
+//! captured.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -74,12 +77,21 @@ pub enum Cardinality {
 /// the report. `distinct` is exact unless `distinct_overflow` is set, in
 /// which case there were strictly more than the enum cap.
 pub struct Profile {
+	/// Count of non-null values observed across every month.
+	pub non_null: usize,
+	/// Count of null/blank cells observed across every month.
+	pub null_count: usize,
 	pub distinct: usize,
 	pub distinct_overflow: bool,
 	pub enum_cap: usize,
 	/// Min/max of values that parsed as numbers (for numeric/bigint cols),
 	/// kept as the original text so the range prints exactly.
 	pub num_range: Option<(String, String)>,
+	/// For a `numeric` column, the tightest `(precision, scale)` that fits
+	/// every observed value — i.e. a `numeric(p, s)` suggestion. `None` when
+	/// the column is not numeric, has no fractional part, or used scientific
+	/// notation (where scale is ambiguous).
+	pub num_scale: Option<(usize, usize)>,
 	/// Lexical (= chronological for ISO values) min/max, shown for
 	/// date/timestamp columns.
 	pub temporal_range: Option<(String, String)>,
@@ -230,12 +242,16 @@ fn candidate_checks(raw: &str) -> [bool; 5] {
 struct Accumulator {
 	non_null: usize,
 	saw_null: bool,
+	null_count: usize,
 	type_ok: [bool; 5],
 	distinct: BTreeSet<String>,
 	distinct_overflow: bool,
 	enum_cap: usize,
 	num_min: Option<(f64, String)>,
 	num_max: Option<(f64, String)>,
+	max_int_digits: usize,
+	max_scale: usize,
+	scale_known: bool,
 	lex_min: Option<String>,
 	lex_max: Option<String>,
 	len_min: Option<usize>,
@@ -248,12 +264,16 @@ impl Accumulator {
 		Self {
 			non_null: 0,
 			saw_null: false,
+			null_count: 0,
 			type_ok: [true; 5],
 			distinct: BTreeSet::new(),
 			distinct_overflow: false,
 			enum_cap: enum_max,
 			num_min: None,
 			num_max: None,
+			max_int_digits: 0,
+			max_scale: 0,
+			scale_known: true,
 			lex_min: None,
 			lex_max: None,
 			len_min: None,
@@ -265,6 +285,7 @@ impl Accumulator {
 	fn observe(&mut self, raw: &str, null: bool, enum_max: usize) {
 		if null {
 			self.saw_null = true;
+			self.null_count += 1;
 			return;
 		}
 		self.non_null += 1;
@@ -281,7 +302,8 @@ impl Accumulator {
 			}
 		}
 
-		// Numeric range, kept with the original text so it prints exactly.
+		// Numeric range, kept with the original text so it prints exactly,
+		// plus the digits needed for a numeric(precision, scale) suggestion.
 		if is_numeric(raw)
 			&& let Ok(v) = raw.parse::<f64>()
 		{
@@ -290,6 +312,13 @@ impl Accumulator {
 			}
 			if self.num_max.as_ref().is_none_or(|(m, _)| v > *m) {
 				self.num_max = Some((v, raw.to_owned()));
+			}
+			match decimal_parts(raw) {
+				Some((int_digits, scale)) => {
+					self.max_int_digits = self.max_int_digits.max(int_digits);
+					self.max_scale = self.max_scale.max(scale);
+				}
+				None => self.scale_known = false,
 			}
 		}
 
@@ -321,7 +350,13 @@ impl Accumulator {
 		let temporal_range = matches!(ty, ColType::Date | ColType::Timestamptz)
 			.then(|| self.lex_min.clone().zip(self.lex_max.clone()))
 			.flatten();
+		// A numeric(p, s) suggestion only makes sense for a numeric column
+		// that actually carries a fractional part and never used exponents.
+		let num_scale = (ty == ColType::Numeric && self.scale_known && self.max_scale > 0)
+			.then(|| ((self.max_int_digits + self.max_scale).max(1), self.max_scale));
 		Profile {
+			non_null: self.non_null,
+			null_count: self.null_count,
 			distinct: if self.distinct_overflow {
 				self.enum_cap
 			} else {
@@ -330,6 +365,7 @@ impl Accumulator {
 			distinct_overflow: self.distinct_overflow,
 			enum_cap: self.enum_cap,
 			num_range,
+			num_scale,
 			temporal_range,
 			len_range: self.len_min.zip(self.len_max),
 			classes: self.classes,
@@ -591,6 +627,19 @@ fn is_numeric(s: &str) -> bool {
 	i == n
 }
 
+/// Split a plain decimal literal into `(significant integer digits,
+/// fractional digits)`, e.g. `-420.00` → `(3, 2)` and `0.50` → `(0, 2)`.
+/// Returns `None` for scientific notation, where scale is ambiguous. Caller
+/// guarantees `s` already passed [`is_numeric`].
+fn decimal_parts(s: &str) -> Option<(usize, usize)> {
+	if s.bytes().any(|b| b == b'e' || b == b'E') {
+		return None;
+	}
+	let s = s.trim_start_matches(['+', '-']);
+	let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
+	Some((int_part.trim_start_matches('0').len(), frac_part.len()))
+}
+
 /// `YYYY-MM-DD` with plausible month/day ranges. Postgres does the real
 /// validation on cast; this just steers inference.
 fn is_date(s: &str) -> bool {
@@ -623,7 +672,10 @@ fn is_timestamp(s: &str) -> bool {
 mod tests {
 	use std::collections::BTreeSet;
 
-	use super::{Accumulator, ColType, is_date, is_numeric, is_timestamp, sanitize_ident};
+	use super::{
+		Accumulator, Cardinality, ColType, check_headers, decimal_parts, is_date, is_numeric,
+		is_timestamp, sanitize_ident,
+	};
 
 	fn feed(values: &[&str], enum_max: usize) -> Accumulator {
 		let mut acc = Accumulator::new(enum_max);
@@ -631,6 +683,11 @@ mod tests {
 			acc.observe(v, v.is_empty(), enum_max);
 		}
 		acc
+	}
+
+	/// Build a column header list from string slices.
+	fn headers(names: &[&str]) -> Vec<String> {
+		names.iter().map(ToString::to_string).collect()
 	}
 
 	#[test]
@@ -675,6 +732,77 @@ mod tests {
 		let acc = feed(&["x", "", "y"], 32);
 		assert!(acc.saw_null);
 		assert_eq!(acc.non_null, 2);
+	}
+
+	#[test]
+	fn profiles_numeric_range_and_scale() {
+		let p = feed(&["1500.00", "-420.00", "30000.00"], 32).profile();
+		assert_eq!(p.num_range, Some(("-420.00".to_owned(), "30000.00".to_owned())));
+		// 30000 has 5 integer digits, scale 2 -> numeric(7, 2).
+		assert_eq!(p.num_scale, Some((7, 2)));
+		// Integers carry no scale suggestion (they're bigint anyway).
+		assert_eq!(feed(&["1", "2", "30"], 32).profile().num_scale, None);
+		// Scientific notation makes scale ambiguous.
+		assert_eq!(feed(&["1.5", "2e3"], 32).profile().num_scale, None);
+	}
+
+	#[test]
+	fn decimal_parts_splits_digits() {
+		assert_eq!(decimal_parts("-420.00"), Some((3, 2)));
+		assert_eq!(decimal_parts("0.50"), Some((0, 2)));
+		assert_eq!(decimal_parts("1500"), Some((4, 0)));
+		assert_eq!(decimal_parts("1e3"), None);
+	}
+
+	#[test]
+	fn cardinality_buckets() {
+		let mk = |n: usize| {
+			let vals: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
+			let refs: Vec<&str> = vals.iter().map(String::as_str).collect();
+			feed(&refs, 64).profile().cardinality()
+		};
+		assert_eq!(mk(3), Cardinality::Enum); // < 5
+		assert_eq!(mk(7), Cardinality::Borderline); // 5..=10
+		assert_eq!(mk(20), Cardinality::Table); // > 10
+		// Past the enum cap, definitely a table.
+		let p = feed(&["a", "b", "c"], 2).profile();
+		assert!(p.distinct_overflow && p.cardinality() == Cardinality::Table);
+	}
+
+	#[test]
+	fn char_classes_and_length() {
+		assert_eq!(
+			feed(&["USD", "CAD", "EUR"], 32).profile().classes.label(),
+			Some("uppercase letters only")
+		);
+		assert_eq!(
+			feed(&["active", "closed"], 32).profile().classes.label(),
+			Some("lowercase letters only")
+		);
+		let p = feed(&["ab", "abcd", "a"], 32).profile();
+		assert_eq!(p.len_range, Some((1, 4)));
+	}
+
+	#[test]
+	fn profile_counts_nulls_and_temporal_range() {
+		let p = feed(&["x", "", "y", ""], 32).profile();
+		assert_eq!((p.non_null, p.null_count), (2, 2));
+		let p = feed(&["2021-12-31", "2019-05-05", "2020-01-01"], 32).profile();
+		assert_eq!(
+			p.temporal_range,
+			Some(("2019-05-05".to_owned(), "2021-12-31".to_owned()))
+		);
+		assert_eq!(p.num_range, None);
+	}
+
+	#[test]
+	fn strict_header_check() {
+		let first = headers(&["a", "b"]);
+		// Order may differ.
+		assert!(check_headers("f", &first, &headers(&["b", "a"])).is_ok());
+		// A dropped or added column is an error.
+		assert!(check_headers("f", &first, &headers(&["a"])).is_err());
+		assert!(check_headers("f", &first, &headers(&["a", "b", "c"])).is_err());
 	}
 
 	#[test]

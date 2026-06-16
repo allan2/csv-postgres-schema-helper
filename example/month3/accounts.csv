@@ -1,0 +1,6 @@
+account_number,customer_name,loan_type,interest_rate,balance,status,opened_on
+1001,Ada King,fixed,3.25,14600.00,active,2019-04-01
+1002,Alan Turing,fixed,3.75,7800.00,active,2020-07-15
+1003,Grace Hopper,fixed,2.99,42000.00,frozen,2018-01-09
+1005,Katherine Johnson,fixed,3.10,29500.00,active,2022-02-28
+1006,Margaret Hamilton,interest_only,6.25,120000.00,active,2023-09-12

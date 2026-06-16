@@ -84,9 +84,11 @@ It shows:
 - **columns & inferred constraints** — for the key and every attribute:
   inferred type, nullability, the **distinct-value count** turned into a
   schema hint (`< 5` → enum candidate, `5–10` → borderline, `> 10` → its own
-  lookup table), plus the observed **range** (numeric/date), **text length**
-  range, and **character class** (e.g. *uppercase only*, *digits only*) —
-  the raw material for `CHECK` constraints;
+  lookup table), the observed **range** (numeric/date), a tight
+  **`numeric(p, s)`** suggestion for decimals, **text length** range,
+  **character class** (e.g. *uppercase only*, *digits only*), and the
+  **null count** when any are present — the raw material for column types and
+  `CHECK` constraints;
 - **attribute changes** — for each attribute, how many accounts changed it
   in each month-to-month transition (attributes that never change are
   omitted);
@@ -102,6 +104,20 @@ By default the run is **strict**: a ragged row, a blank account key, or a
 file whose columns differ from the first file's all abort with the offending
 file named. Pass `--lenient` to tolerate these (skip bad rows, union
 headers) as earlier versions did.
+
+The constraint block looks like this (from `testdata/`):
+
+```
+columns & inferred constraints (8 attributes + key):
+  account_id    bigint       key
+                  distinct 6  ·  range 2001 .. 2006
+  currency      text         not null
+                  distinct 3 -> enum candidate (<5)  ·  length 3  ·  uppercase letters only
+  balance       numeric      not null
+                  distinct 21 -> lookup table candidate (>10)  ·  range -420.00 .. 30000.00  ·  fits numeric(7,2)
+  credit_limit  numeric      nullable
+                  distinct 3 -> enum candidate (<5)  ·  range 2000.00 .. 15000.00  ·  fits numeric(7,2)  ·  15/21 null
+```
 
 ### 3. load — store only the deltas
 
@@ -146,4 +162,7 @@ JOIN account.account_status        s ON s.id = a.id AND s.during @> '2024-02-15'
 --create-schema    run the CREATE script before loading (load)
 ```
 
-A runnable three-month example lives in `example/`. Tests: `cargo test`.
+Runnable examples live in `example/` (a minimal three-month set) and
+`testdata/` (a richer four-month set with quoted fields, nulls, a late-
+arriving enum value, and an account added and removed) — point `--list` at
+either `list.txt`. Tests: `cargo test`.

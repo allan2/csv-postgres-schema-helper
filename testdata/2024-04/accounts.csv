@@ -1,0 +1,6 @@
+account_id,holder_name,account_type,currency,balance,credit_limit,status,region_code,opened_on
+2001,Ada King,checking,USD,1440.00,,active,NA,2019-04-01
+2002,Alan Turing,loan,CAD,7600.00,15000.00,active,EU,2020-07-15
+2003,"Hopper, Grace",credit,USD,0.00,5000.00,closed,NA,2018-01-09
+2005,Katherine Johnson,savings,USD,28500.00,,active,NA,2022-02-28
+2006,Margaret Hamilton,checking,USD,11600.00,2000.00,active,NA,2023-09-12

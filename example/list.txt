@@ -1,0 +1,6 @@
+# One CSV per line, processed top to bottom. An optional second field
+# gives the observation date (else it is lifted from the path, else
+# synthetic consecutive months are used). Here the dates come from the path.
+month1/accounts.csv  2024-01-01
+month2/accounts.csv  2024-02-01
+month3/accounts.csv  2024-03-01

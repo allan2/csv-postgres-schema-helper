@@ -4,8 +4,12 @@
 //! `load` on column types, the account key, and which columns are
 //! enum-like) and then diffs consecutive files purely in memory — no
 //! database needed. It answers the questions the README cares about: which
-//! accounts came and went, which attributes actually change, and when each
-//! enum value first appeared.
+//! accounts came and went, which attributes actually change (down to the
+//! literal `old -> new` values), and when each distinct value first
+//! appeared. It also prints the per-column value profile inferred upstream —
+//! distinct-count cardinality (enum vs. lookup table), numeric/date ranges,
+//! a `numeric(p, s)` suggestion, text length, character class, and null
+//! counts — so the schema's constraints can be chosen before any load.
 
 use std::{
 	collections::{BTreeMap, HashMap},
@@ -292,6 +296,9 @@ fn constraint_detail(col: &Column, is_key: bool) -> String {
 			format!("range {lo} .. {hi}")
 		});
 	}
+	if let Some((precision, scale)) = p.num_scale {
+		parts.push(format!("fits numeric({precision},{scale})"));
+	}
 	if let Some((lo, hi)) = &p.temporal_range {
 		parts.push(if lo == hi {
 			format!("date {lo}")
@@ -310,6 +317,12 @@ fn constraint_detail(col: &Column, is_key: bool) -> String {
 		if let Some(label) = p.classes.label() {
 			parts.push(label.to_owned());
 		}
+	}
+
+	// Nulls matter for the NOT NULL decision; show the count when present.
+	if !is_key && p.null_count > 0 {
+		let total = p.non_null + p.null_count;
+		parts.push(format!("{}/{} null", p.null_count, total));
 	}
 
 	parts.join("  ·  ")
@@ -480,4 +493,86 @@ fn summarize<T>(items: &[T], render: impl Fn(&T) -> String) -> String {
 		let _ = write!(s, ", … and {} more", items.len() - MAX);
 	}
 	s
+}
+
+#[cfg(test)]
+mod tests {
+	use std::fs;
+
+	use super::run;
+	use crate::{infer, manifest};
+
+	/// Build a manifest + two CSVs in a temp dir and run the report end to
+	/// end, exercising inference, snapshotting, and every section.
+	#[test]
+	fn end_to_end_report() {
+		let dir = std::env::temp_dir().join(format!("csvpg-report-test-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&dir);
+		fs::create_dir_all(&dir).unwrap();
+		fs::write(
+			dir.join("m1.csv"),
+			"account_id,status,balance\n1,active,10.00\n2,active,20.00\n",
+		)
+		.unwrap();
+		fs::write(
+			dir.join("m2.csv"),
+			"account_id,status,balance\n1,closed,10.50\n2,active,20.00\n3,active,5.00\n",
+		)
+		.unwrap();
+		let list = dir.join("list.txt");
+		fs::write(
+			&list,
+			format!(
+				"{}\n{}\n",
+				dir.join("m1.csv").display(),
+				dir.join("m2.csv").display()
+			),
+		)
+		.unwrap();
+
+		let entries = manifest::parse(&list).unwrap();
+		let opts = infer::Options {
+			schema: "account".to_owned(),
+			key: None,
+			enum_max: 32,
+			null_tokens: Vec::new(),
+			strict: true,
+		};
+		let schema = infer::build_schema(&entries, &opts).unwrap();
+		let out = run(&schema, &entries, &[], true).unwrap();
+
+		assert!(out.contains("key: account_id"));
+		assert!(out.contains("value transitions"));
+		assert!(out.contains("1: active -> closed"));
+		assert!(out.contains("fits numeric(4,2)"));
+		assert!(out.contains("added after first month: 3"));
+
+		let _ = fs::remove_dir_all(&dir);
+	}
+
+	/// A blank account key aborts a strict run but is tolerated otherwise.
+	#[test]
+	fn strict_rejects_blank_key() {
+		let dir = std::env::temp_dir().join(format!("csvpg-report-blank-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&dir);
+		fs::create_dir_all(&dir).unwrap();
+		fs::write(dir.join("m1.csv"), "account_id,status\n1,active\n,active\n").unwrap();
+		let list = dir.join("list.txt");
+		fs::write(&list, format!("{}\n", dir.join("m1.csv").display())).unwrap();
+
+		let entries = manifest::parse(&list).unwrap();
+		let opts = infer::Options {
+			schema: "account".to_owned(),
+			key: None,
+			enum_max: 32,
+			null_tokens: Vec::new(),
+			strict: true,
+		};
+		let schema = infer::build_schema(&entries, &opts).unwrap();
+
+		assert!(run(&schema, &entries, &[], true).is_err());
+		assert!(run(&schema, &entries, &[], false).is_ok());
+
+		let _ = fs::remove_dir_all(&dir);
+	}
 }

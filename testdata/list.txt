@@ -1,0 +1,5 @@
+# Four monthly snapshots. Dates are lifted from the path (YYYY-MM).
+2024-01/accounts.csv
+2024-02/accounts.csv
+2024-03/accounts.csv
+2024-04/accounts.csv
