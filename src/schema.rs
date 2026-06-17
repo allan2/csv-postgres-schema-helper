@@ -6,7 +6,7 @@
 
 use std::fmt::Write as _;
 
-use crate::infer::{ColType, Column, Schema};
+use crate::infer::{Cardinality, CharClasses, ColType, Column, Schema};
 
 /// Build the full `CREATE` script. Safe to feed straight to
 /// `psql -f` or to `Client::batch_execute`.
@@ -15,7 +15,14 @@ use crate::infer::{ColType, Column, Schema};
 /// change over time gets its own temporal `(id, during)` history table; one
 /// that never changed lives directly on the `account` table as a plain
 /// column, since it needs no history.
-pub fn render(schema: &Schema, changed: &[bool]) -> String {
+///
+/// When `checks` is set, the inferred value [`crate::infer::Profile`] is
+/// baked into the DDL: numeric columns take a `numeric(p, s)` type and a
+/// range check, low-cardinality text columns get an `IN (...)` membership
+/// check, and other text columns get length and character-class checks.
+/// These describe only what the input files actually contained, so they are
+/// opt-in — a later month with an out-of-range value would violate them.
+pub fn render(schema: &Schema, changed: &[bool], checks: bool) -> String {
 	let s = &schema.name;
 	let mut out = String::new();
 
@@ -54,11 +61,12 @@ pub fn render(schema: &Schema, changed: &[bool]) -> String {
 			continue;
 		}
 		let nullable = if col.nullable { "" } else { " NOT NULL" };
+		let check = column_check(col, checks).map_or_else(String::new, |c| format!(" {c}"));
 		let _ = write!(
 			static_cols,
-			"\t{ident} {ty}{nullable},",
+			"\t{ident} {ty}{nullable}{check},",
 			ident = col.ident,
-			ty = col.ty.sql(),
+			ty = column_sql_type(col, checks),
 		);
 		// Only a text column reads as a genuine enum; a low-cardinality date
 		// or numeric just happens to repeat, so don't mislabel it.
@@ -89,14 +97,19 @@ pub fn render(schema: &Schema, changed: &[bool]) -> String {
 
 	for (col, &chg) in schema.attrs.iter().zip(changed) {
 		if chg {
-			render_attr(&mut out, s, col);
+			render_attr(&mut out, s, col, checks);
 		}
 	}
 	out
 }
 
-fn render_attr(out: &mut String, schema: &str, col: &Column) {
-	if let Some(values) = &col.enum_values {
+fn render_attr(out: &mut String, schema: &str, col: &Column, checks: bool) {
+	// Only a text column reads as a genuine enum; a low-cardinality date or
+	// numeric just happens to repeat, so don't mislabel it (matches the
+	// inline static-column path above).
+	if col.ty == ColType::Text
+		&& let Some(values) = &col.enum_values
+	{
 		let _ = writeln!(
 			out,
 			"/* enum-like ({} distinct observed): {} */",
@@ -105,20 +118,107 @@ fn render_attr(out: &mut String, schema: &str, col: &Column) {
 		);
 	}
 	let nullable = if col.nullable { "" } else { " NOT NULL" };
+	let check = column_check(col, checks).map_or_else(String::new, |c| format!(" {c}"));
 	let _ = writeln!(
 		out,
 		"CREATE TABLE {schema}.account_{ident}\n\
 		 (\n\
 		 \tid         integer   NOT NULL REFERENCES {schema}.account (id),\n\
-		 \t{ident}    {ty}{nullable},\n\
+		 \t{ident}    {ty}{nullable}{check},\n\
 		 \tduring     tstzrange NOT NULL DEFAULT tstzrange(now(), 'infinity'),\n\
 		 \trequest_id integer   NOT NULL REFERENCES {schema}.import_request (id),\n\
 		 \tPRIMARY KEY (id, during),\n\
 		 \tUNIQUE (id, during WITHOUT OVERLAPS)\n\
 		 );\n",
 		ident = col.ident,
-		ty = col.ty.sql(),
+		ty = column_sql_type(col, checks),
 	);
+}
+
+/// The column's SQL type, refined to `numeric(p, s)` when `checks` is on and
+/// inference captured a precision/scale; otherwise the base type.
+fn column_sql_type(col: &Column, checks: bool) -> String {
+	if checks
+		&& col.ty == ColType::Numeric
+		&& let Some((precision, scale)) = col.profile.num_scale
+	{
+		return format!("numeric({precision},{scale})");
+	}
+	col.ty.sql().to_owned()
+}
+
+/// Build a single combined `CHECK (...)` clause from the column's value
+/// profile, or `None` when nothing applies (or `checks` is off). Enum
+/// membership subsumes the length/class checks, so it's used alone.
+fn column_check(col: &Column, checks: bool) -> Option<String> {
+	if !checks {
+		return None;
+	}
+	let id = &col.ident;
+	let p = &col.profile;
+	let mut conds: Vec<String> = Vec::new();
+
+	if col.ty == ColType::Text
+		&& p.cardinality() == Cardinality::Enum
+		&& let Some(values) = &col.enum_values
+	{
+		let list: Vec<String> = values.iter().map(|v| sql_str(v)).collect();
+		conds.push(format!("{id} IN ({})", list.join(", ")));
+	} else {
+		match col.ty {
+			ColType::Text => {
+				if let Some((lo, hi)) = p.len_range {
+					conds.push(if lo == hi {
+						format!("char_length({id}) = {lo}")
+					} else {
+						format!("char_length({id}) BETWEEN {lo} AND {hi}")
+					});
+				}
+				if let Some(cond) = class_check(id, p.classes) {
+					conds.push(cond);
+				}
+			}
+			ColType::Integer | ColType::Bigint | ColType::Numeric => {
+				if let Some((lo, hi)) = &p.num_range {
+					conds.push(format!("{id} BETWEEN {lo} AND {hi}"));
+				}
+			}
+			ColType::Boolean | ColType::Date | ColType::Timestamptz => {}
+		}
+	}
+
+	(!conds.is_empty()).then(|| format!("CHECK ({})", conds.join(" AND ")))
+}
+
+/// A regex/negation check for the tightest character class, mirroring
+/// [`CharClasses::label`]. `None` when no class is worth enforcing.
+fn class_check(id: &str, c: CharClasses) -> Option<String> {
+	if !c.any {
+		return None;
+	}
+	let cond = if c.all_digit {
+		format!("{id} ~ '^[0-9]+$'")
+	} else if c.all_alpha && c.has_letter && c.no_lower {
+		format!("{id} ~ '^[A-Z]+$'")
+	} else if c.all_alpha && c.has_letter && c.no_upper {
+		format!("{id} ~ '^[a-z]+$'")
+	} else if c.all_alpha {
+		format!("{id} ~ '^[A-Za-z]+$'")
+	} else if c.has_letter && c.no_lower {
+		format!("{id} !~ '[a-z]'")
+	} else if c.has_letter && c.no_upper {
+		format!("{id} !~ '[A-Z]'")
+	} else if c.all_alnum {
+		format!("{id} ~ '^[A-Za-z0-9]+$'")
+	} else {
+		return None;
+	};
+	Some(cond)
+}
+
+/// Single-quote a value for SQL, doubling any embedded quotes.
+fn sql_str(v: &str) -> String {
+	format!("'{}'", v.replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -165,13 +265,67 @@ mod tests {
 		};
 		let schema = infer::build_schema(&entries, &opts).unwrap();
 		let changed = report::changing_columns(&schema, &entries, &[], true).unwrap();
-		let ddl = schema::render(&schema, &changed);
+		let ddl = schema::render(&schema, &changed, false);
 
 		// status changes -> its own temporal history table.
 		assert!(ddl.contains("CREATE TABLE account.account_status"));
 		// opened_on is constant -> inline column on account, no history table.
 		assert!(!ddl.contains("account_opened_on"));
 		assert!(ddl.contains("\topened_on date"));
+
+		let _ = fs::remove_dir_all(&dir);
+	}
+
+	/// `--with-checks` bakes the value profile into the DDL: enum membership,
+	/// a refined numeric type with a range check, and text length/class.
+	#[test]
+	fn with_checks_emits_constraints() {
+		let dir = std::env::temp_dir().join(format!("csvpg-checks-test-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&dir);
+		fs::create_dir_all(&dir).unwrap();
+		fs::write(
+			dir.join("m1.csv"),
+			"account_id,currency,balance\n1,USD,10.00\n2,CAD,20.00\n",
+		)
+		.unwrap();
+		fs::write(
+			dir.join("m2.csv"),
+			"account_id,currency,balance\n1,USD,10.50\n2,EUR,20.50\n",
+		)
+		.unwrap();
+		let list = dir.join("list.txt");
+		fs::write(
+			&list,
+			format!(
+				"{}\n{}\n",
+				dir.join("m1.csv").display(),
+				dir.join("m2.csv").display()
+			),
+		)
+		.unwrap();
+
+		let entries = manifest::parse(&list).unwrap();
+		let opts = infer::Options {
+			schema: "account".to_owned(),
+			key: None,
+			enum_max: 32,
+			null_tokens: Vec::new(),
+			strict: true,
+		};
+		let schema = infer::build_schema(&entries, &opts).unwrap();
+		let changed = report::changing_columns(&schema, &entries, &[], true).unwrap();
+
+		// Without checks: bare types, no CHECK.
+		let plain = schema::render(&schema, &changed, false);
+		assert!(!plain.contains("CHECK"));
+		assert!(plain.contains("numeric,") || plain.contains("numeric "));
+
+		// With checks: enum IN-list, numeric(p,s) + range, uppercase class.
+		let ddl = schema::render(&schema, &changed, true);
+		assert!(ddl.contains("currency IN ('CAD', 'EUR', 'USD')"));
+		assert!(ddl.contains("numeric(4,2)"));
+		assert!(ddl.contains("balance BETWEEN 10.00 AND 20.50"));
+		assert!(ddl.contains("currency ~ '^[A-Z]+$'") || ddl.contains("currency IN"));
 
 		let _ = fs::remove_dir_all(&dir);
 	}

@@ -77,6 +77,23 @@ style:
 (With only one file there is nothing to compare, so every attribute is kept
 temporal.)
 
+Pass `--with-checks` to bake the inferred value profile into the DDL instead
+of just commenting it: numeric columns take a `numeric(p, s)` type and a
+range check, low-cardinality text columns get an `IN (...)` membership check,
+and other text columns get length and character-class checks:
+
+```sql
+balance      numeric(7,2) NOT NULL CHECK (balance BETWEEN -420.00 AND 30000.00),
+currency     text NOT NULL CHECK (currency IN ('CAD', 'EUR', 'USD')),
+holder_name  text NOT NULL CHECK (char_length(holder_name) BETWEEN 8 AND 17),
+```
+
+A non-enum text column that shares a character class instead gets a regex
+check (e.g. an all-uppercase code becomes `CHECK (code ~ '^[A-Z]+$')`). These
+describe only what the input files actually contained, so they are opt-in: a
+later month with an out-of-range value would violate them. `load
+--with-checks --create-schema` applies the same constrained DDL.
+
 ### 2. report — compare the CSVs month over month
 
 Diffs the listed CSVs in memory (no database) and prints a comparison
@@ -217,6 +234,8 @@ join.
 --null-token TOK   value to treat as NULL besides empty string (repeatable)
 --lenient          tolerate ragged rows, blank keys, and header drift
                    instead of erroring (default: strict)
+--with-checks      bake the inferred profile into the DDL as numeric(p,s)
+                   types and CHECK constraints (analyze, load)
 -o, --out FILE     write output to a file (analyze, report, rust)
 --database-url URL connection string (load; falls back to $DATABASE_URL)
 --create-schema    run the CREATE script before loading (load)

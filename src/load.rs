@@ -35,14 +35,22 @@ pub struct Stats {
 	pub skipped: usize,
 }
 
+/// How to load, beyond the connection itself: which cells count as null,
+/// whether to validate strictly, which attributes are temporal (`changed`,
+/// aligned to `schema.attrs`), and whether `--create-schema` bakes in checks.
+pub struct Config<'a> {
+	pub null_tokens: &'a [String],
+	pub strict: bool,
+	pub changed: &'a [bool],
+	pub checks: bool,
+}
+
 pub async fn run(
 	schema: &Schema,
 	entries: &[Entry],
 	db_url: &str,
 	create_schema: bool,
-	null_tokens: &[String],
-	strict: bool,
-	changed: &[bool],
+	cfg: &Config<'_>,
 ) -> Result<Stats> {
 	let (mut client, connection) = tokio_postgres::connect(db_url, NoTls).await?;
 	tokio::spawn(async move {
@@ -53,7 +61,7 @@ pub async fn run(
 
 	if create_schema {
 		client
-			.batch_execute(&schema::render(schema, changed))
+			.batch_execute(&schema::render(schema, cfg.changed, cfg.checks))
 			.await?;
 	}
 
@@ -63,16 +71,7 @@ pub async fn run(
 		skipped: 0,
 	};
 	for entry in entries {
-		load_file(
-			&mut client,
-			schema,
-			entry,
-			null_tokens,
-			strict,
-			changed,
-			&mut stats,
-		)
-		.await?;
+		load_file(&mut client, schema, entry, cfg, &mut stats).await?;
 		stats.files += 1;
 	}
 	Ok(stats)
@@ -84,16 +83,14 @@ async fn load_file(
 	client: &mut Client,
 	schema: &Schema,
 	entry: &Entry,
-	null_tokens: &[String],
-	strict: bool,
-	changed: &[bool],
+	cfg: &Config<'_>,
 	stats: &mut Stats,
 ) -> Result<()> {
 	let tx = client.transaction().await?;
 	let request_id = insert_request(&tx, schema, &entry.source, &entry.at).await?;
 
 	let mut rdr = csv::ReaderBuilder::new()
-		.flexible(!strict)
+		.flexible(!cfg.strict)
 		.from_path(&entry.path)?;
 	let headers: Vec<String> = rdr.headers()?.iter().map(ToOwned::to_owned).collect();
 
@@ -104,7 +101,7 @@ async fn load_file(
 	let mut static_cols: Vec<&Column> = Vec::new();
 	let mut static_idx: Vec<Option<usize>> = Vec::new();
 	let mut changing: Vec<(&Column, Option<usize>)> = Vec::new();
-	for (col, &chg) in schema.attrs.iter().zip(changed) {
+	for (col, &chg) in schema.attrs.iter().zip(cfg.changed) {
 		let idx = headers.iter().position(|h| *h == col.header);
 		if chg {
 			changing.push((col, idx));
@@ -117,8 +114,8 @@ async fn load_file(
 	for (row, record) in rdr.records().enumerate() {
 		let record = record?;
 		let key_raw = key_idx.and_then(|i| record.get(i)).unwrap_or("");
-		if is_null(key_raw, null_tokens) {
-			if strict {
+		if is_null(key_raw, cfg.null_tokens) {
+			if cfg.strict {
 				return Err(Error::Data {
 					source: entry.source.clone(),
 					message: format!("row {}: empty key column `{}`", row + 2, schema.key.header),
@@ -133,7 +130,7 @@ async fn load_file(
 		}
 		let cell = |idx: Option<usize>| {
 			let raw = idx.and_then(|i| record.get(i)).unwrap_or("");
-			if is_null(raw, null_tokens) {
+			if is_null(raw, cfg.null_tokens) {
 				None
 			} else {
 				Some(raw)

@@ -52,6 +52,8 @@ options:
   --null-token TOK   value to treat as NULL besides empty (repeatable)
   --lenient          tolerate ragged rows, blank keys, and header drift
                      instead of erroring (default: strict)
+  --with-checks      bake the inferred profile into the DDL as numeric(p,s)
+                     types and CHECK constraints (analyze, load)
   -o, --out FILE     write output to a file instead of stdout (analyze, report, rust)
   --database-url URL postgres connection string (load; or env DATABASE_URL)
   --create-schema    run the CREATE script before loading (load)";
@@ -71,6 +73,7 @@ struct Cli {
 	out: Option<PathBuf>,
 	database_url: Option<String>,
 	create_schema: bool,
+	with_checks: bool,
 }
 
 #[tokio::main]
@@ -97,7 +100,7 @@ async fn run() -> Result<()> {
 				&cli.options.null_tokens,
 				cli.options.strict,
 			)?;
-			let ddl = schema::render(&schema, &changed);
+			let ddl = schema::render(&schema, &changed, cli.with_checks);
 			let temporal = changed.iter().filter(|c| **c).count();
 			if let Some(path) = &cli.out {
 				std::fs::write(path, &ddl)?;
@@ -148,16 +151,13 @@ async fn run() -> Result<()> {
 				&cli.options.null_tokens,
 				cli.options.strict,
 			)?;
-			let stats = load::run(
-				&schema,
-				&entries,
-				&url,
-				cli.create_schema,
-				&cli.options.null_tokens,
-				cli.options.strict,
-				&changed,
-			)
-			.await?;
+			let cfg = load::Config {
+				null_tokens: &cli.options.null_tokens,
+				strict: cli.options.strict,
+				changed: &changed,
+				checks: cli.with_checks,
+			};
+			let stats = load::run(&schema, &entries, &url, cli.create_schema, &cfg).await?;
 			eprintln!(
 				"loaded {} file(s), {} row(s), {} skipped",
 				stats.files, stats.rows, stats.skipped
@@ -191,6 +191,7 @@ fn parse_args() -> Result<Cli> {
 	let mut out: Option<PathBuf> = None;
 	let mut database_url: Option<String> = None;
 	let mut create_schema = false;
+	let mut with_checks = false;
 
 	while let Some(arg) = args.next() {
 		match arg.as_str() {
@@ -208,6 +209,7 @@ fn parse_args() -> Result<Cli> {
 			"-o" | "--out" => out = Some(PathBuf::from(value(&mut args, "--out")?)),
 			"--database-url" => database_url = Some(value(&mut args, "--database-url")?),
 			"--create-schema" => create_schema = true,
+			"--with-checks" => with_checks = true,
 			"-h" | "--help" => return Err(Error::Usage(USAGE.to_owned())),
 			other => {
 				return Err(Error::Usage(format!("unknown option `{other}`\n\n{USAGE}")));
@@ -229,6 +231,7 @@ fn parse_args() -> Result<Cli> {
 		out,
 		database_url,
 		create_schema,
+		with_checks,
 	})
 }
 
