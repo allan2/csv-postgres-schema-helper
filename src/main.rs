@@ -90,6 +90,9 @@ async fn main() -> ExitCode {
 async fn run() -> Result<()> {
 	let cli = parse_args()?;
 	let entries = manifest::parse(&cli.list)?;
+	if cli.options.strict {
+		manifest::check_order(&entries)?;
+	}
 	let schema = infer::build_schema(&entries, &cli.options)?;
 
 	match cli.command {

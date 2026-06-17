@@ -105,6 +105,26 @@ pub fn parse(list_path: &Path) -> Result<Vec<Entry>> {
 	Ok(entries)
 }
 
+/// Strict-mode check that observation instants strictly increase down the
+/// list. The temporal upsert closes each open range at the next file's
+/// instant, so a repeated or out-of-order `at` would build inverted or
+/// overlapping ranges. ISO `at` strings compare lexically in time order.
+pub fn check_order(entries: &[Entry]) -> Result<()> {
+	for pair in entries.windows(2) {
+		let (prev, cur) = (&pair[0], &pair[1]);
+		if cur.at <= prev.at {
+			return Err(Error::Data {
+				source: cur.source.clone(),
+				message: format!(
+					"out of order: instant {} is not after `{}` ({}); list files in increasing date order",
+					cur.at, prev.source, prev.at
+				),
+			});
+		}
+	}
+	Ok(())
+}
+
 /// `2000-01-01`, `2000-02-01`, … one month apart, in list order.
 fn synthetic_month(index: usize) -> String {
 	let year = 2000 + index / 12;
@@ -154,7 +174,28 @@ fn date_from_path(source: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-	use super::{date_from_path, is_instant, synthetic_month};
+	use std::path::PathBuf;
+
+	use super::{Entry, check_order, date_from_path, is_instant, synthetic_month};
+
+	fn entries(ats: &[&str]) -> Vec<Entry> {
+		ats.iter()
+			.map(|at| Entry {
+				path: PathBuf::from(at),
+				source: (*at).to_owned(),
+				at: (*at).to_owned(),
+			})
+			.collect()
+	}
+
+	#[test]
+	fn order_must_strictly_increase() {
+		assert!(check_order(&entries(&["2024-01-01", "2024-02-01", "2024-03-01"])).is_ok());
+		// Backwards.
+		assert!(check_order(&entries(&["2024-02-01", "2024-01-01"])).is_err());
+		// Repeated instant is also rejected (would overlap in time).
+		assert!(check_order(&entries(&["2024-01-01", "2024-01-01"])).is_err());
+	}
 
 	#[test]
 	fn lifts_dates_from_paths() {

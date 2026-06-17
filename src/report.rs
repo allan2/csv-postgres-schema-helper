@@ -151,7 +151,7 @@ fn read_snapshots(
 				}
 				continue;
 			}
-			let row: Vec<Option<String>> = attr_idx
+			let vals: Vec<Option<String>> = attr_idx
 				.iter()
 				.map(|idx| {
 					let raw = idx.and_then(|i| record.get(i)).unwrap_or("");
@@ -162,7 +162,14 @@ fn read_snapshots(
 					}
 				})
 				.collect();
-			values.insert(key.to_owned(), row);
+			// One row per account per month; a repeat key in the same file is
+			// a data error, not a legitimate second observation.
+			if values.insert(key.to_owned(), vals).is_some() && strict {
+				return Err(Error::Data {
+					source: entry.source.clone(),
+					message: format!("row {}: duplicate account key `{key}`", row + 2),
+				});
+			}
 		}
 		snaps.push(Snapshot {
 			source: entry.source.clone(),
@@ -645,6 +652,37 @@ mod tests {
 		let _ = fs::remove_dir_all(&dir);
 		fs::create_dir_all(&dir).unwrap();
 		fs::write(dir.join("m1.csv"), "account_id,status\n1,active\n,active\n").unwrap();
+		let list = dir.join("list.txt");
+		fs::write(&list, format!("{}\n", dir.join("m1.csv").display())).unwrap();
+
+		let entries = manifest::parse(&list).unwrap();
+		let opts = infer::Options {
+			schema: "account".to_owned(),
+			key: None,
+			enum_max: 32,
+			null_tokens: Vec::new(),
+			strict: true,
+		};
+		let schema = infer::build_schema(&entries, &opts).unwrap();
+
+		assert!(run(&schema, &entries, &[], true).is_err());
+		assert!(run(&schema, &entries, &[], false).is_ok());
+
+		let _ = fs::remove_dir_all(&dir);
+	}
+
+	/// A repeated account key within one file aborts a strict run but is
+	/// tolerated (last row wins) otherwise.
+	#[test]
+	fn strict_rejects_duplicate_key() {
+		let dir = std::env::temp_dir().join(format!("csvpg-report-dup-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&dir);
+		fs::create_dir_all(&dir).unwrap();
+		fs::write(
+			dir.join("m1.csv"),
+			"account_id,status\n1,active\n2,active\n1,closed\n",
+		)
+		.unwrap();
 		let list = dir.join("list.txt");
 		fs::write(&list, format!("{}\n", dir.join("m1.csv").display())).unwrap();
 

@@ -16,7 +16,7 @@
 //! numeric and reject the string bind. This keeps one generic upsert
 //! working for every column without per-type plumbing.
 
-use std::fmt::Write as _;
+use std::{collections::HashSet, fmt::Write as _};
 
 use tokio_postgres::{Client, NoTls, Transaction, types::ToSql};
 
@@ -111,6 +111,7 @@ async fn load_file(
 		}
 	}
 
+	let mut seen: HashSet<String> = HashSet::new();
 	for (row, record) in rdr.records().enumerate() {
 		let record = record?;
 		let key_raw = key_idx.and_then(|i| record.get(i)).unwrap_or("");
@@ -127,6 +128,14 @@ async fn load_file(
 			);
 			stats.skipped += 1;
 			continue;
+		}
+		// One row per account per month; reject a repeat key in strict mode
+		// rather than silently upserting the same account twice.
+		if cfg.strict && !seen.insert(key_raw.to_owned()) {
+			return Err(Error::Data {
+				source: entry.source.clone(),
+				message: format!("row {}: duplicate account key `{key_raw}`", row + 2),
+			});
 		}
 		let cell = |idx: Option<usize>| {
 			let raw = idx.and_then(|i| record.get(i)).unwrap_or("");

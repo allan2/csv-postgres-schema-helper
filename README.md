@@ -128,10 +128,11 @@ It shows:
 - **account lifecycle** — distinct accounts, how many persist across every
   month, and which were added later or disappeared.
 
-By default the run is **strict**: a ragged row, a blank account key, or a
-file whose columns differ from the first file's all abort with the offending
-file named. Pass `--lenient` to tolerate these (skip bad rows, union
-headers) as earlier versions did.
+By default the run is **strict**: a ragged row, a blank account key, a
+duplicate account key within one file, a file whose columns differ from the
+first file's, or files listed out of date order all abort with the offending
+file named. Pass `--lenient` to tolerate these (skip bad rows, let the last
+duplicate win, union headers, ignore ordering) as earlier versions did.
 
 The columns table looks like this (from `testdata/`):
 
