@@ -16,7 +16,9 @@
 //! numeric and reject the string bind. This keeps one generic upsert
 //! working for every column without per-type plumbing.
 
-use tokio_postgres::{Client, NoTls, Transaction};
+use std::fmt::Write as _;
+
+use tokio_postgres::{Client, NoTls, Transaction, types::ToSql};
 
 use crate::{
 	error::{Error, Result},
@@ -40,6 +42,7 @@ pub async fn run(
 	create_schema: bool,
 	null_tokens: &[String],
 	strict: bool,
+	changed: &[bool],
 ) -> Result<Stats> {
 	let (mut client, connection) = tokio_postgres::connect(db_url, NoTls).await?;
 	tokio::spawn(async move {
@@ -49,7 +52,9 @@ pub async fn run(
 	});
 
 	if create_schema {
-		client.batch_execute(&schema::render(schema)).await?;
+		client
+			.batch_execute(&schema::render(schema, changed))
+			.await?;
 	}
 
 	let mut stats = Stats {
@@ -58,7 +63,16 @@ pub async fn run(
 		skipped: 0,
 	};
 	for entry in entries {
-		load_file(&mut client, schema, entry, null_tokens, strict, &mut stats).await?;
+		load_file(
+			&mut client,
+			schema,
+			entry,
+			null_tokens,
+			strict,
+			changed,
+			&mut stats,
+		)
+		.await?;
 		stats.files += 1;
 	}
 	Ok(stats)
@@ -72,6 +86,7 @@ async fn load_file(
 	entry: &Entry,
 	null_tokens: &[String],
 	strict: bool,
+	changed: &[bool],
 	stats: &mut Stats,
 ) -> Result<()> {
 	let tx = client.transaction().await?;
@@ -83,11 +98,21 @@ async fn load_file(
 	let headers: Vec<String> = rdr.headers()?.iter().map(ToOwned::to_owned).collect();
 
 	let key_idx = headers.iter().position(|h| *h == schema.key.header);
-	let attr_idx: Vec<Option<usize>> = schema
-		.attrs
-		.iter()
-		.map(|c| headers.iter().position(|h| *h == c.header))
-		.collect();
+	// Split the attributes by whether they change over time: static ones are
+	// written inline on the account row, changing ones go through the temporal
+	// upsert. Header positions are resolved once, here.
+	let mut static_cols: Vec<&Column> = Vec::new();
+	let mut static_idx: Vec<Option<usize>> = Vec::new();
+	let mut changing: Vec<(&Column, Option<usize>)> = Vec::new();
+	for (col, &chg) in schema.attrs.iter().zip(changed) {
+		let idx = headers.iter().position(|h| *h == col.header);
+		if chg {
+			changing.push((col, idx));
+		} else {
+			static_cols.push(col);
+			static_idx.push(idx);
+		}
+	}
 
 	for (row, record) in rdr.records().enumerate() {
 		let record = record?;
@@ -96,11 +121,7 @@ async fn load_file(
 			if strict {
 				return Err(Error::Data {
 					source: entry.source.clone(),
-					message: format!(
-						"row {}: empty key column `{}`",
-						row + 2,
-						schema.key.header
-					),
+					message: format!("row {}: empty key column `{}`", row + 2, schema.key.header),
 				});
 			}
 			eprintln!(
@@ -110,20 +131,24 @@ async fn load_file(
 			stats.skipped += 1;
 			continue;
 		}
-		let account_id = ensure_account(&tx, schema, key_raw, request_id).await?;
-		for (col, idx) in schema.attrs.iter().zip(&attr_idx) {
+		let cell = |idx: Option<usize>| {
 			let raw = idx.and_then(|i| record.get(i)).unwrap_or("");
-			let value = if is_null(raw, null_tokens) {
+			if is_null(raw, null_tokens) {
 				None
 			} else {
 				Some(raw)
-			};
+			}
+		};
+		let static_vals: Vec<Option<&str>> = static_idx.iter().map(|idx| cell(*idx)).collect();
+		let account_id =
+			ensure_account(&tx, schema, key_raw, &static_cols, &static_vals, request_id).await?;
+		for &(col, idx) in &changing {
 			upsert_attr(
 				&tx,
 				&schema.name,
 				col,
 				account_id,
-				value,
+				cell(idx),
 				request_id,
 				&entry.at,
 			)
@@ -153,22 +178,39 @@ async fn insert_request(
 /// Insert the account on first sighting, or fetch its surrogate id on a
 /// repeat. The no-op `DO UPDATE` (rather than `DO NOTHING`) is what lets
 /// `RETURNING` hand back the existing row's id on conflict. The
-/// `request_id` only takes effect on the insert path; on conflict the
-/// account keeps its original first-seen provenance.
+/// `request_id` and the static attribute values only take effect on the
+/// insert path; on conflict the account keeps its original first-seen
+/// provenance and (immutable) static values.
 async fn ensure_account(
 	tx: &Transaction<'_>,
 	schema: &Schema,
 	key: &str,
+	static_cols: &[&Column],
+	static_vals: &[Option<&str>],
 	request_id: i32,
 ) -> Result<i32> {
 	let kty = schema.key.ty.sql();
 	let kcol = &schema.key.ident;
+	let mut cols = kcol.clone();
+	let mut vals = format!("$1::text::{kty}");
+	for (i, col) in static_cols.iter().enumerate() {
+		let _ = write!(cols, ", {}", col.ident);
+		let _ = write!(vals, ", ${}::text::{}", i + 2, col.ty.sql());
+	}
+	let _ = write!(cols, ", request_id");
+	let _ = write!(vals, ", ${}", static_cols.len() + 2);
 	let sql = format!(
-		"INSERT INTO {s}.account ({kcol}, request_id) VALUES ($1::text::{kty}, $2) \
+		"INSERT INTO {s}.account ({cols}) VALUES ({vals}) \
 		 ON CONFLICT ({kcol}) DO UPDATE SET {kcol} = EXCLUDED.{kcol} RETURNING id",
 		s = schema.name,
 	);
-	let row = tx.query_one(sql.as_str(), &[&key, &request_id]).await?;
+	let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(static_cols.len() + 2);
+	params.push(&key);
+	for v in static_vals {
+		params.push(v);
+	}
+	params.push(&request_id);
+	let row = tx.query_one(sql.as_str(), &params).await?;
 	Ok(row.get(0))
 }
 

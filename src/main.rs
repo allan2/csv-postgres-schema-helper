@@ -6,6 +6,8 @@
 //!                       [--enum-max N] [--null-token TOK]... [-o FILE]
 //! csv-pg-schema report  --list FILE [--key COL]
 //!                       [--enum-max N] [--null-token TOK]... [-o FILE]
+//! csv-pg-schema rust    --list FILE [--key COL]
+//!                       [--enum-max N] [--null-token TOK]... [-o FILE]
 //! csv-pg-schema load    --list FILE  [--schema NAME] [--key COL]
 //!                       [--enum-max N] [--null-token TOK]...
 //!                       [--database-url URL] [--create-schema]
@@ -13,12 +15,14 @@
 //!
 //! `analyze` scans every CSV in the list and prints the `CREATE` script
 //! (one temporal `(id, during)` table per attribute). `report` diffs the
-//! CSVs month over month (no database needed). `load` re-infers the same
-//! schema and writes each month's rows as deltas, using the
-//! `WITHOUT OVERLAPS` upsert so unchanged values cost nothing.
+//! CSVs month over month (no database needed). `rust` emits an `InputRecord`
+//! struct (plus enums for enum-like columns) for the inferred schema. `load`
+//! re-infers the same schema and writes each month's rows as deltas, using
+//! the `WITHOUT OVERLAPS` upsert so unchanged values cost nothing.
 //!
 //! Environment: `DATABASE_URL` is the fallback for `--database-url`.
 
+mod codegen;
 mod error;
 mod infer;
 mod load;
@@ -34,9 +38,10 @@ use crate::{
 	infer::Options,
 };
 
-const USAGE: &str = "usage: csv-pg-schema <analyze|report|load> --list FILE [options]
+const USAGE: &str = "usage: csv-pg-schema <analyze|report|rust|load> --list FILE [options]
   analyze   scan the CSVs and print the temporal CREATE script
   report    diff the CSVs month over month (no database needed)
+  rust      emit an InputRecord struct (and enums) for the schema
   load      process the CSVs in order, storing only the deltas
 
 options:
@@ -47,7 +52,7 @@ options:
   --null-token TOK   value to treat as NULL besides empty (repeatable)
   --lenient          tolerate ragged rows, blank keys, and header drift
                      instead of erroring (default: strict)
-  -o, --out FILE     write output to a file instead of stdout (analyze, report)
+  -o, --out FILE     write output to a file instead of stdout (analyze, report, rust)
   --database-url URL postgres connection string (load; or env DATABASE_URL)
   --create-schema    run the CREATE script before loading (load)";
 
@@ -55,6 +60,7 @@ options:
 enum Command {
 	Analyze,
 	Report,
+	Rust,
 	Load,
 }
 
@@ -85,13 +91,21 @@ async fn run() -> Result<()> {
 
 	match cli.command {
 		Command::Analyze => {
-			let ddl = schema::render(&schema);
+			let changed = report::changing_columns(
+				&schema,
+				&entries,
+				&cli.options.null_tokens,
+				cli.options.strict,
+			)?;
+			let ddl = schema::render(&schema, &changed);
+			let temporal = changed.iter().filter(|c| **c).count();
 			if let Some(path) = &cli.out {
 				std::fs::write(path, &ddl)?;
 				eprintln!(
-					"wrote {} ({} attributes)",
+					"wrote {} ({} attributes, {} temporal)",
 					path.display(),
-					schema.attrs.len()
+					schema.attrs.len(),
+					temporal
 				);
 			} else {
 				print!("{ddl}");
@@ -112,6 +126,15 @@ async fn run() -> Result<()> {
 				print!("{text}");
 			}
 		}
+		Command::Rust => {
+			let code = codegen::render(&schema);
+			if let Some(path) = &cli.out {
+				std::fs::write(path, &code)?;
+				eprintln!("wrote {}", path.display());
+			} else {
+				print!("{code}");
+			}
+		}
 		Command::Load => {
 			let url = cli
 				.database_url
@@ -119,6 +142,12 @@ async fn run() -> Result<()> {
 				.or_else(|| std::env::var("DATABASE_URL").ok())
 				.filter(|s| !s.is_empty())
 				.ok_or(Error::MissingEnv("DATABASE_URL"))?;
+			let changed = report::changing_columns(
+				&schema,
+				&entries,
+				&cli.options.null_tokens,
+				cli.options.strict,
+			)?;
 			let stats = load::run(
 				&schema,
 				&entries,
@@ -126,6 +155,7 @@ async fn run() -> Result<()> {
 				cli.create_schema,
 				&cli.options.null_tokens,
 				cli.options.strict,
+				&changed,
 			)
 			.await?;
 			eprintln!(
@@ -142,6 +172,7 @@ fn parse_args() -> Result<Cli> {
 	let command = match args.next().as_deref() {
 		Some("analyze") => Command::Analyze,
 		Some("report") => Command::Report,
+		Some("rust") => Command::Rust,
 		Some("load") => Command::Load,
 		Some("-h" | "--help" | "help") | None => return Err(Error::Usage(USAGE.to_owned())),
 		Some(other) => {

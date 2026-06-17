@@ -6,11 +6,16 @@
 
 use std::fmt::Write as _;
 
-use crate::infer::{Column, Schema};
+use crate::infer::{ColType, Column, Schema};
 
 /// Build the full `CREATE` script. Safe to feed straight to
 /// `psql -f` or to `Client::batch_execute`.
-pub fn render(schema: &Schema) -> String {
+///
+/// `changed` is aligned to `schema.attrs`: an attribute that was observed to
+/// change over time gets its own temporal `(id, during)` history table; one
+/// that never changed lives directly on the `account` table as a plain
+/// column, since it needs no history.
+pub fn render(schema: &Schema, changed: &[bool]) -> String {
 	let s = &schema.name;
 	let mut out = String::new();
 
@@ -18,9 +23,10 @@ pub fn render(schema: &Schema) -> String {
 	for src in &schema.sources {
 		let _ = writeln!(out, "     {src}");
 	}
-	out.push_str("\n   Temporal, one-table-per-attribute design: each mutable\n");
-	out.push_str("   attribute keeps its own history keyed by (id, during) with\n");
-	out.push_str("   UNIQUE (id, during WITHOUT OVERLAPS). Apply with psql -f. */\n\n");
+	out.push_str("\n   Temporal, one-table-per-changing-attribute design: an attribute\n");
+	out.push_str("   that changes over time keeps its own history keyed by (id, during)\n");
+	out.push_str("   with UNIQUE (id, during WITHOUT OVERLAPS); an attribute that never\n");
+	out.push_str("   changes is a plain column on account. Apply with psql -f. */\n\n");
 
 	let _ = writeln!(out, "CREATE SCHEMA {s};\n");
 	out.push_str("/* Needed so UNIQUE (id, during WITHOUT OVERLAPS) can build its\n");
@@ -40,23 +46,51 @@ pub fn render(schema: &Schema) -> String {
 		 );\n"
 	);
 
-	out.push_str("/* The account entity. Its surrogate id threads every attribute\n");
-	out.push_str("   history together; the natural key from the CSV stays unique. */\n");
-	let _ = writeln!(
+	// Static attributes (no observed change) become plain columns on the
+	// account row rather than their own history table.
+	let mut static_cols = String::new();
+	for (col, &chg) in schema.attrs.iter().zip(changed) {
+		if chg {
+			continue;
+		}
+		let nullable = if col.nullable { "" } else { " NOT NULL" };
+		let _ = write!(
+			static_cols,
+			"\t{ident} {ty}{nullable},",
+			ident = col.ident,
+			ty = col.ty.sql(),
+		);
+		// Only a text column reads as a genuine enum; a low-cardinality date
+		// or numeric just happens to repeat, so don't mislabel it.
+		if col.ty == ColType::Text
+			&& let Some(values) = &col.enum_values
+		{
+			let _ = write!(static_cols, "  -- enum-like: {}", values.join(" | "));
+		}
+		static_cols.push('\n');
+	}
+
+	out.push_str("/* The account entity. Its surrogate id threads every changing\n");
+	out.push_str("   attribute's history together; the natural key stays unique, and\n");
+	out.push_str("   attributes that never change are kept inline here. */\n");
+	let _ = write!(
 		out,
 		"CREATE TABLE {s}.account\n\
 		 (\n\
 		 \tid         integer PRIMARY KEY GENERATED ALWAYS AS IDENTITY,\n\
 		 \t{key} {kty} NOT NULL,\n\
+		 {static_cols}\
 		 \trequest_id integer NOT NULL REFERENCES {s}.import_request (id),\n\
 		 \tUNIQUE ({key})\n\
-		 );\n",
+		 );\n\n",
 		key = schema.key.ident,
 		kty = schema.key.ty.sql(),
 	);
 
-	for col in &schema.attrs {
-		render_attr(&mut out, s, col);
+	for (col, &chg) in schema.attrs.iter().zip(changed) {
+		if chg {
+			render_attr(&mut out, s, col);
+		}
 	}
 	out
 }
@@ -85,4 +119,60 @@ fn render_attr(out: &mut String, schema: &str, col: &Column) {
 		ident = col.ident,
 		ty = col.ty.sql(),
 	);
+}
+
+#[cfg(test)]
+mod tests {
+	use std::fs;
+
+	use crate::{infer, manifest, report, schema};
+
+	/// A changing attribute gets its own history table; a constant one is a
+	/// plain column on `account` with no history table.
+	#[test]
+	fn static_columns_live_on_account() {
+		let dir = std::env::temp_dir().join(format!("csvpg-schema-test-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&dir);
+		fs::create_dir_all(&dir).unwrap();
+		fs::write(
+			dir.join("m1.csv"),
+			"account_id,status,opened_on\n1,active,2020-01-01\n2,active,2019-05-05\n",
+		)
+		.unwrap();
+		fs::write(
+			dir.join("m2.csv"),
+			"account_id,status,opened_on\n1,closed,2020-01-01\n2,active,2019-05-05\n",
+		)
+		.unwrap();
+		let list = dir.join("list.txt");
+		fs::write(
+			&list,
+			format!(
+				"{}\n{}\n",
+				dir.join("m1.csv").display(),
+				dir.join("m2.csv").display()
+			),
+		)
+		.unwrap();
+
+		let entries = manifest::parse(&list).unwrap();
+		let opts = infer::Options {
+			schema: "account".to_owned(),
+			key: None,
+			enum_max: 32,
+			null_tokens: Vec::new(),
+			strict: true,
+		};
+		let schema = infer::build_schema(&entries, &opts).unwrap();
+		let changed = report::changing_columns(&schema, &entries, &[], true).unwrap();
+		let ddl = schema::render(&schema, &changed);
+
+		// status changes -> its own temporal history table.
+		assert!(ddl.contains("CREATE TABLE account.account_status"));
+		// opened_on is constant -> inline column on account, no history table.
+		assert!(!ddl.contains("account_opened_on"));
+		assert!(ddl.contains("\topened_on date"));
+
+		let _ = fs::remove_dir_all(&dir);
+	}
 }

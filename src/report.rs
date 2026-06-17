@@ -76,7 +76,11 @@ pub fn run(
 			for (a, (p, c)) in prevrow.iter().zip(currow).enumerate() {
 				if p != c {
 					attr_changes[a][t] += 1;
-					samples[a][t].push((key.clone(), render_cell(p.as_ref()), render_cell(c.as_ref())));
+					samples[a][t].push((
+						key.clone(),
+						render_cell(p.as_ref()),
+						render_cell(c.as_ref()),
+					));
 					diffs += 1;
 				}
 			}
@@ -99,7 +103,11 @@ pub fn run(
 		&changed_accounts,
 		&changed_cells,
 	);
-	write_columns(&mut out, schema);
+	let changed: Vec<bool> = attr_changes
+		.iter()
+		.map(|c| c.iter().sum::<usize>() > 0)
+		.collect();
+	write_columns(&mut out, schema, &changed, n_trans > 0);
 	write_attr_changes(&mut out, schema, &attr_changes, n_trans);
 	write_transitions(&mut out, schema, &mut samples, n_trans);
 	write_enums(&mut out, schema, &snaps);
@@ -134,7 +142,11 @@ fn read_snapshots(
 				if strict {
 					return Err(Error::Data {
 						source: entry.source.clone(),
-						message: format!("row {}: empty key column `{}`", row + 2, schema.key.header),
+						message: format!(
+							"row {}: empty key column `{}`",
+							row + 2,
+							schema.key.header
+						),
 					});
 				}
 				continue;
@@ -159,6 +171,42 @@ fn read_snapshots(
 		});
 	}
 	Ok(snaps)
+}
+
+/// Which attributes (aligned to `schema.attrs`) ever change value for some
+/// account from one month to the next. This is the file comparison that
+/// drives the schema: a column that changes earns its own temporal history
+/// table, while one that never changes can live directly on `account`.
+///
+/// With fewer than two months there is nothing to compare, so we
+/// conservatively report every attribute as changing (i.e. keep it
+/// temporal) rather than guess that it is immutable from a single snapshot.
+pub fn changing_columns(
+	schema: &Schema,
+	entries: &[Entry],
+	null_tokens: &[String],
+	strict: bool,
+) -> Result<Vec<bool>> {
+	let snaps = read_snapshots(schema, entries, null_tokens, strict)?;
+	let n_attr = schema.attrs.len();
+	if snaps.len() < 2 {
+		return Ok(vec![true; n_attr]);
+	}
+	let mut changed = vec![false; n_attr];
+	for pair in snaps.windows(2) {
+		let (prev, cur) = (&pair[0].values, &pair[1].values);
+		for (key, currow) in cur {
+			let Some(prevrow) = prev.get(key) else {
+				continue;
+			};
+			for (a, (p, c)) in prevrow.iter().zip(currow).enumerate() {
+				if p != c {
+					changed[a] = true;
+				}
+			}
+		}
+	}
+	Ok(changed)
 }
 
 /// First and last file index in which each account appears.
@@ -228,28 +276,57 @@ fn write_per_file(
 	out.push('\n');
 }
 
-fn write_columns(out: &mut String, schema: &Schema) {
-	let w = schema
+/// One row per column in an aligned table: name, type, nullability, whether
+/// it changes over time, and the inferred-constraint summary. The `changes`
+/// column is the quick answer to "does this column move?" — `yes`/`no`, or
+/// `?` when there is only one file to look at.
+fn write_columns(out: &mut String, schema: &Schema, changed: &[bool], determinable: bool) {
+	let name_w = schema
 		.attrs
 		.iter()
 		.map(|c| c.ident.len())
+		.chain(std::iter::once(schema.key.ident.len()))
 		.max()
-		.unwrap_or(9)
-		.max(schema.key.ident.len())
-		.max(9);
+		.unwrap_or(6)
+		.max("column".len());
+	let type_w = schema
+		.attrs
+		.iter()
+		.map(|c| c.ty.sql().len())
+		.chain(std::iter::once(schema.key.ty.sql().len()))
+		.max()
+		.unwrap_or(4)
+		.max("type".len());
 	let _ = writeln!(
 		out,
-		"columns & inferred constraints ({} attributes + key):",
+		"columns (key + {} attributes; \"changes\" = differs month to month):",
 		schema.attrs.len()
 	);
-	write_column_row(out, &schema.key, w, true);
-	for col in &schema.attrs {
-		write_column_row(out, col, w, false);
+	let _ = writeln!(
+		out,
+		"  {:<name_w$}  {:<type_w$}  {:<8}  {:<7}  summary",
+		"column", "type", "nullable", "changes"
+	);
+	write_table_row(out, &schema.key, name_w, type_w, true, "-");
+	for (col, &chg) in schema.attrs.iter().zip(changed) {
+		let mark = if determinable {
+			if chg { "yes" } else { "no" }
+		} else {
+			"?"
+		};
+		write_table_row(out, col, name_w, type_w, false, mark);
 	}
 	out.push('\n');
 }
 
-fn write_column_row(out: &mut String, col: &Column, w: usize, is_key: bool) {
+fn write_table_row(
+	out: &mut String,
+	col: &Column,
+	name_w: usize,
+	type_w: usize,
+	is_key: bool,
+	changes: &str,
+) {
 	let null = if is_key {
 		"key"
 	} else if col.nullable {
@@ -257,11 +334,15 @@ fn write_column_row(out: &mut String, col: &Column, w: usize, is_key: bool) {
 	} else {
 		"not null"
 	};
-	let _ = writeln!(out, "  {:<w$}  {:<12} {}", col.ident, col.ty.sql(), null);
-	let detail = constraint_detail(col, is_key);
-	if !detail.is_empty() {
-		let _ = writeln!(out, "  {:<w$}    {}", "", detail);
-	}
+	let _ = writeln!(
+		out,
+		"  {:<name_w$}  {:<type_w$}  {:<8}  {:<7}  {}",
+		col.ident,
+		col.ty.sql(),
+		null,
+		changes,
+		constraint_detail(col, is_key),
+	);
 }
 
 /// Assemble the indented constraint line for a column: cardinality verdict
@@ -298,6 +379,13 @@ fn constraint_detail(col: &Column, is_key: bool) -> String {
 	}
 	if let Some((precision, scale)) = p.num_scale {
 		parts.push(format!("fits numeric({precision},{scale})"));
+	}
+	if let Some((lo, hi)) = p.decimals {
+		parts.push(if lo == hi {
+			format!("{lo} decimal(s)")
+		} else {
+			format!("decimals {lo}..{hi}")
+		});
 	}
 	if let Some((lo, hi)) = &p.temporal_range {
 		parts.push(if lo == hi {

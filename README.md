@@ -47,25 +47,35 @@ month3/accounts.csv  2024-03-01
 ### 1. analyze — infer the schema
 
 Scans every listed CSV once, infers each column's type (`boolean`,
-`bigint`, `numeric`, `date`, `timestamptz`, else `text`), and flags
-low-cardinality columns as enum-like — listing the distinct values it saw.
+`integer`, `bigint`, `numeric`, `date`, `timestamptz`, else `text` —
+integer columns stay `integer`/`i32` until a value needs the wider
+`bigint`/`i64`), and flags low-cardinality columns as enum-like — listing
+the distinct values it saw.
 Because it scans *all* months together, a rare value that only shows up in a
-later month is still captured. It prints the temporal `CREATE` script:
+later month is still captured. It also **compares the files** to see which
+columns actually change over time, and emits a history table **only** for
+those — a column that never changes is just a plain column on `account`,
+since it needs no history. It prints the temporal `CREATE` script:
 
 ```sh
 csv-pg-schema analyze --list example/list.txt          # to stdout
 csv-pg-schema analyze --list example/list.txt -o schema.sql
 ```
 
-The generated schema follows the one-table-per-attribute temporal style:
+The generated schema follows the one-table-per-*changing*-attribute temporal
+style:
 
 - `account` — the entity, keyed by the CSV's natural key (auto-detected, or
-  `--key COL`), mapped to a surrogate `id`.
-- `account_<attr>` — one history table per attribute, each row
+  `--key COL`), mapped to a surrogate `id`. **Static attributes** (those that
+  never change across the inputs) are plain columns right here.
+- `account_<attr>` — one history table per **changing** attribute, each row
   `(id, <attr>, during tstzrange, request_id)` with
   `PRIMARY KEY (id, during)` and `UNIQUE (id, during WITHOUT OVERLAPS)`.
 - `import_request` — one row per processed file (provenance + the
   observation instant shared by every range it writes).
+
+(With only one file there is nothing to compare, so every attribute is kept
+temporal.)
 
 ### 2. report — compare the CSVs month over month
 
@@ -81,14 +91,15 @@ It shows:
 
 - **per-file overview** — rows, accounts added/removed, and how many
   accounts/cells changed versus the previous month;
-- **columns & inferred constraints** — for the key and every attribute:
-  inferred type, nullability, the **distinct-value count** turned into a
-  schema hint (`< 5` → enum candidate, `5–10` → borderline, `> 10` → its own
-  lookup table), the observed **range** (numeric/date), a tight
-  **`numeric(p, s)`** suggestion for decimals, **text length** range,
-  **character class** (e.g. *uppercase only*, *digits only*), and the
-  **null count** when any are present — the raw material for column types and
-  `CHECK` constraints;
+- **columns** — an aligned table with one row per column: inferred type,
+  nullability, a **changes** flag (`yes`/`no` — does it differ month to
+  month, the same signal that decides temporal vs. plain column; `?` with a
+  single file), and a **summary** of the inferred constraints: the
+  **distinct-value count** turned into a schema hint (`< 5` → enum candidate,
+  `5–10` → borderline, `> 10` → its own lookup table), the observed **range**
+  (numeric/date), a tight **`numeric(p, s)`** suggestion plus the **min/max
+  decimal places**, **text length** range, **character class** (e.g.
+  *uppercase only*, *digits only*), and the **null count** when present;
 - **attribute changes** — for each attribute, how many accounts changed it
   in each month-to-month transition (attributes that never change are
   omitted);
@@ -105,23 +116,68 @@ file whose columns differ from the first file's all abort with the offending
 file named. Pass `--lenient` to tolerate these (skip bad rows, union
 headers) as earlier versions did.
 
-The constraint block looks like this (from `testdata/`):
+The columns table looks like this (from `testdata/`):
 
 ```
-columns & inferred constraints (8 attributes + key):
-  account_id    bigint       key
-                  distinct 6  ·  range 2001 .. 2006
-  currency      text         not null
-                  distinct 3 -> enum candidate (<5)  ·  length 3  ·  uppercase letters only
-  balance       numeric      not null
-                  distinct 21 -> lookup table candidate (>10)  ·  range -420.00 .. 30000.00  ·  fits numeric(7,2)
-  credit_limit  numeric      nullable
-                  distinct 3 -> enum candidate (<5)  ·  range 2000.00 .. 15000.00  ·  fits numeric(7,2)  ·  15/21 null
+columns (key + 8 attributes; "changes" = differs month to month):
+  column        type     nullable  changes  summary
+  account_id    integer  key       -        distinct 6  ·  range 2001 .. 2006
+  holder_name   text     not null  yes      distinct 7 -> borderline (5-10)  ·  length 8-17  ·  ASCII only
+  currency      text     not null  yes      distinct 3 -> enum candidate (<5)  ·  length 3  ·  uppercase letters only
+  balance       numeric  not null  yes      distinct 21 -> lookup table candidate (>10)  ·  range -420.00 .. 30000.00  ·  fits numeric(7,2)  ·  2 decimal(s)
+  credit_limit  numeric  nullable  yes      distinct 3 -> enum candidate (<5)  ·  range 2000.00 .. 15000.00  ·  fits numeric(7,2)  ·  2 decimal(s)  ·  15/21 null
+  region_code   text     not null  no       distinct 2 -> enum candidate (<5)  ·  length 2  ·  uppercase letters only
+  opened_on     date     not null  no       distinct 6 -> borderline (5-10)  ·  range 2018-01-09 .. 2023-09-12
 ```
 
-### 3. load — store only the deltas
+So `region_code` and `opened_on` never change and become plain columns on
+`account`; everything marked `yes` gets its own temporal history table.
 
-Re-infers the same schema, then processes the files in order. Each
+### 3. rust — generate an `InputRecord` struct
+
+Emits Rust source for the inferred schema: an `InputRecord` struct with one
+field per column, plus a Rust enum for every genuinely categorical column.
+
+```sh
+csv-pg-schema rust --list example/list.txt           # to stdout
+csv-pg-schema rust --list example/list.txt -o input_record.rs
+```
+
+The field types mirror the inferred Postgres types: `integer`/`bigint` →
+`i32`/`i64`, `numeric` → `f64`, `boolean` → `bool`, and `date`/`timestamptz`/
+`text` → `String` (no date crate is pulled in). A nullable column becomes
+`Option<T>`. A `text` column whose cardinality is in the `< 5` enum-candidate
+band becomes its own enum (with `as_str` and `FromStr`), and that enum is the
+field's type — so the "a loan is fixed or variable" columns are typed, while
+names, dates, and numerics keep their scalar types.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Active,
+    Closed,
+    Dormant,
+    Frozen,
+}
+// ... as_str / FromStr impls ...
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputRecord {
+    pub account_id: i32,
+    pub holder_name: String,
+    pub currency: Currency,
+    pub balance: f64,
+    pub credit_limit: Option<f64>,
+    pub status: Status,
+    pub opened_on: String,
+}
+```
+
+### 4. load — store only the deltas
+
+Re-infers the same schema (including the same temporal-vs-static decision),
+then processes the files in order. Static attributes are written once, inline
+on the `account` row when the account is first seen. Each **changing**
 attribute write is an *upsert in time*: the current open range is closed at
 the observation instant **only if the value changed**, and a new
 `[at, infinity)` range opens **only if** none already covers that instant.
@@ -147,6 +203,10 @@ JOIN account.account_balance       b ON b.id = a.id AND b.during @> '2024-02-15'
 JOIN account.account_status        s ON s.id = a.id AND s.during @> '2024-02-15'::timestamptz;
 ```
 
+Static attributes need no join — they are columns on `account` itself
+(`a.opened_on`), so only the columns that actually change require a temporal
+join.
+
 ### Options
 
 ```
@@ -157,7 +217,7 @@ JOIN account.account_status        s ON s.id = a.id AND s.during @> '2024-02-15'
 --null-token TOK   value to treat as NULL besides empty string (repeatable)
 --lenient          tolerate ragged rows, blank keys, and header drift
                    instead of erroring (default: strict)
--o, --out FILE     write output to a file (analyze, report)
+-o, --out FILE     write output to a file (analyze, report, rust)
 --database-url URL connection string (load; falls back to $DATABASE_URL)
 --create-schema    run the CREATE script before loading (load)
 ```

@@ -26,6 +26,7 @@ use crate::{
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ColType {
 	Boolean,
+	Integer,
 	Bigint,
 	Numeric,
 	Date,
@@ -39,11 +40,27 @@ impl ColType {
 	pub const fn sql(self) -> &'static str {
 		match self {
 			Self::Boolean => "boolean",
+			Self::Integer => "integer",
 			Self::Bigint => "bigint",
 			Self::Numeric => "numeric",
 			Self::Date => "date",
 			Self::Timestamptz => "timestamptz",
 			Self::Text => "text",
+		}
+	}
+
+	/// The Rust type used for this column in a generated `InputRecord`
+	/// (before nullability wraps it in `Option`). Integers split into
+	/// `i32`/`i64` to match the Postgres `integer`/`bigint` choice;
+	/// `numeric` becomes `f64`; dates and timestamps are kept as the
+	/// original `String` (no date crate is pulled in).
+	pub const fn rust(self) -> &'static str {
+		match self {
+			Self::Boolean => "bool",
+			Self::Integer => "i32",
+			Self::Bigint => "i64",
+			Self::Numeric => "f64",
+			Self::Date | Self::Timestamptz | Self::Text => "String",
 		}
 	}
 }
@@ -92,6 +109,10 @@ pub struct Profile {
 	/// the column is not numeric, has no fractional part, or used scientific
 	/// notation (where scale is ambiguous).
 	pub num_scale: Option<(usize, usize)>,
+	/// For a `numeric` column, the `(min, max)` count of fractional digits
+	/// observed across every month — e.g. a column mixing `3.5` and `3.250`
+	/// reports `(1, 3)`. `None` under the same conditions as [`Self::num_scale`].
+	pub decimals: Option<(usize, usize)>,
 	/// Lexical (= chronological for ISO values) min/max, shown for
 	/// date/timestamp columns.
 	pub temporal_range: Option<(String, String)>,
@@ -217,9 +238,12 @@ pub struct Options {
 
 /// The candidate scalar types, most specific first. `Accumulator::type_ok`
 /// is indexed in this order; [`ColType::Text`] is the fallback and never
-/// has a slot (every value satisfies it).
-const CANDIDATES: [ColType; 5] = [
+/// has a slot (every value satisfies it). `Integer` precedes `Bigint`: a
+/// column whose every value fits in `i32` becomes `integer`, and the first
+/// out-of-range value drops it to `bigint`.
+const CANDIDATES: [ColType; 6] = [
 	ColType::Boolean,
+	ColType::Integer,
 	ColType::Bigint,
 	ColType::Numeric,
 	ColType::Date,
@@ -227,9 +251,10 @@ const CANDIDATES: [ColType; 5] = [
 ];
 
 /// Apply each candidate's predicate to a value, in [`CANDIDATES`] order.
-fn candidate_checks(raw: &str) -> [bool; 5] {
+fn candidate_checks(raw: &str) -> [bool; 6] {
 	[
 		is_bool(raw),
+		is_i32(raw),
 		is_int(raw),
 		is_numeric(raw),
 		is_date(raw),
@@ -243,13 +268,14 @@ struct Accumulator {
 	non_null: usize,
 	saw_null: bool,
 	null_count: usize,
-	type_ok: [bool; 5],
+	type_ok: [bool; 6],
 	distinct: BTreeSet<String>,
 	distinct_overflow: bool,
 	enum_cap: usize,
 	num_min: Option<(f64, String)>,
 	num_max: Option<(f64, String)>,
 	max_int_digits: usize,
+	min_scale: usize,
 	max_scale: usize,
 	scale_known: bool,
 	lex_min: Option<String>,
@@ -265,13 +291,14 @@ impl Accumulator {
 			non_null: 0,
 			saw_null: false,
 			null_count: 0,
-			type_ok: [true; 5],
+			type_ok: [true; 6],
 			distinct: BTreeSet::new(),
 			distinct_overflow: false,
 			enum_cap: enum_max,
 			num_min: None,
 			num_max: None,
 			max_int_digits: 0,
+			min_scale: usize::MAX,
 			max_scale: 0,
 			scale_known: true,
 			lex_min: None,
@@ -316,6 +343,7 @@ impl Accumulator {
 			match decimal_parts(raw) {
 				Some((int_digits, scale)) => {
 					self.max_int_digits = self.max_int_digits.max(int_digits);
+					self.min_scale = self.min_scale.min(scale);
 					self.max_scale = self.max_scale.max(scale);
 				}
 				None => self.scale_known = false,
@@ -339,7 +367,7 @@ impl Accumulator {
 
 	fn profile(&self) -> Profile {
 		let ty = self.col_type();
-		let num_range = matches!(ty, ColType::Bigint | ColType::Numeric)
+		let num_range = matches!(ty, ColType::Integer | ColType::Bigint | ColType::Numeric)
 			.then(|| {
 				self.num_min
 					.as_ref()
@@ -352,8 +380,14 @@ impl Accumulator {
 			.flatten();
 		// A numeric(p, s) suggestion only makes sense for a numeric column
 		// that actually carries a fractional part and never used exponents.
-		let num_scale = (ty == ColType::Numeric && self.scale_known && self.max_scale > 0)
-			.then(|| ((self.max_int_digits + self.max_scale).max(1), self.max_scale));
+		let has_decimals = ty == ColType::Numeric && self.scale_known && self.max_scale > 0;
+		let num_scale = has_decimals.then(|| {
+			(
+				(self.max_int_digits + self.max_scale).max(1),
+				self.max_scale,
+			)
+		});
+		let decimals = has_decimals.then(|| (self.min_scale.min(self.max_scale), self.max_scale));
 		Profile {
 			non_null: self.non_null,
 			null_count: self.null_count,
@@ -366,6 +400,7 @@ impl Accumulator {
 			enum_cap: self.enum_cap,
 			num_range,
 			num_scale,
+			decimals,
 			temporal_range,
 			len_range: self.len_min.zip(self.len_max),
 			classes: self.classes,
@@ -577,6 +612,12 @@ fn is_bool(s: &str) -> bool {
 	)
 }
 
+/// Fits a Postgres `integer` (Rust `i32`). Checked before [`is_int`] so a
+/// column stays `integer` until a value needs the wider `bigint`.
+fn is_i32(s: &str) -> bool {
+	s.parse::<i32>().is_ok()
+}
+
 fn is_int(s: &str) -> bool {
 	s.parse::<i64>().is_ok()
 }
@@ -700,7 +741,12 @@ mod tests {
 
 	#[test]
 	fn picks_most_specific_type() {
-		assert_eq!(feed(&["1", "2", "30"], 32).col_type(), ColType::Bigint);
+		assert_eq!(feed(&["1", "2", "30"], 32).col_type(), ColType::Integer);
+		// One value past i32::MAX widens the whole column to bigint.
+		assert_eq!(
+			feed(&["1", "2", "5000000000"], 32).col_type(),
+			ColType::Bigint
+		);
 		assert_eq!(feed(&["1.5", "2", "30"], 32).col_type(), ColType::Numeric);
 		assert_eq!(
 			feed(&["true", "false", "t"], 32).col_type(),
@@ -737,11 +783,20 @@ mod tests {
 	#[test]
 	fn profiles_numeric_range_and_scale() {
 		let p = feed(&["1500.00", "-420.00", "30000.00"], 32).profile();
-		assert_eq!(p.num_range, Some(("-420.00".to_owned(), "30000.00".to_owned())));
+		assert_eq!(
+			p.num_range,
+			Some(("-420.00".to_owned(), "30000.00".to_owned()))
+		);
 		// 30000 has 5 integer digits, scale 2 -> numeric(7, 2).
 		assert_eq!(p.num_scale, Some((7, 2)));
-		// Integers carry no scale suggestion (they're bigint anyway).
+		// Uniform scale collapses to a single decimals count.
+		assert_eq!(p.decimals, Some((2, 2)));
+		// Mixed fractional widths report the min and max decimal places.
+		let p = feed(&["3.5", "3.250", "3.00"], 32).profile();
+		assert_eq!(p.decimals, Some((1, 3)));
+		// Integers carry no scale suggestion (they're integer/bigint anyway).
 		assert_eq!(feed(&["1", "2", "30"], 32).profile().num_scale, None);
+		assert_eq!(feed(&["1", "2", "30"], 32).profile().decimals, None);
 		// Scientific notation makes scale ambiguous.
 		assert_eq!(feed(&["1.5", "2e3"], 32).profile().num_scale, None);
 	}
