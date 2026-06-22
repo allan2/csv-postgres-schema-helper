@@ -3,7 +3,6 @@ name = "csv-postgres-schema-helper"
 version = "0.0.0"
 edition = "2024"
 description = "Infer a temporal Postgres schema from monthly account CSVs and load only the deltas"
-authors = ["Allan <al@internal.aigu.io>"]
 publish = false
 
 [[bin]]
